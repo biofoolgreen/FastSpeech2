@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import torch
 import yaml
@@ -7,6 +8,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import numpy as np
 
 from utils.model import get_model, get_vocoder, get_param_num
 from utils.tools import to_device, log, synth_one_sample
@@ -14,9 +16,12 @@ from model import FastSpeech2Loss
 from dataset import Dataset
 
 from evaluate import evaluate
+# from apex import amp
 
+use_amp = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+dtype = torch.float16 if use_amp else torch.float32
+np_dtype = np.float16 if dtype==torch.float16 else np.float32
 
 def main(args, configs):
     print("Prepare training ...")
@@ -39,13 +44,19 @@ def main(args, configs):
 
     # Prepare model
     model, optimizer = get_model(args, configs, device, train=True)
+    # if use_amp:
+    #     model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     model = nn.DataParallel(model)
     num_param = get_param_num(model)
     Loss = FastSpeech2Loss(preprocess_config, model_config).to(device)
-    print("Number of FastSpeech2 Parameters:", num_param)
+    print(f"Number of FastSpeech2 Parameters: {num_param/1.0e6:.2f}M")
 
     # Load vocoder
     vocoder = get_vocoder(model_config, device)
+    if use_amp:
+        vocoder.half()
+        # model.half()
 
     # Init logger
     for p in train_config["path"].values():
@@ -72,43 +83,50 @@ def main(args, configs):
     outer_bar.n = args.restore_step
     outer_bar.update()
 
+    avg_dur = 0.0
     while True:
         inner_bar = tqdm(total=len(loader), desc="Epoch {}".format(epoch), position=1)
         for batchs in loader:
             for batch in batchs:
-                batch = to_device(batch, device)
+                start = time.time()
+                batch = to_device(batch, device, dtype=dtype)
+                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=use_amp):
+                    # Forward
+                    output = model(*(batch[2:]))
 
-                # Forward
-                output = model(*(batch[2:]))
+                    # Cal Loss
+                    losses = Loss(batch, output)
+                    total_loss = losses[0]
 
-                # Cal Loss
-                losses = Loss(batch, output)
-                total_loss = losses[0]
+                    # Backward
+                    total_loss = total_loss / grad_acc_step
+                    scaler.scale(total_loss).backward()
+                    if step % grad_acc_step == 0:
 
-                # Backward
-                total_loss = total_loss / grad_acc_step
-                total_loss.backward()
-                if step % grad_acc_step == 0:
-                    # Clipping gradients to avoid gradient explosion
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
-
-                    # Update weights
-                    optimizer.step_and_update_lr()
-                    optimizer.zero_grad()
-
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip_thresh)
+                        # optimizer.step_and_update_lr()
+                        optimizer._update_learning_rate()
+                        scaler.step(optimizer._optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                    avg_dur += (time.time() - start)
                 if step % log_step == 0:
+                    total_bs = batch[3].shape[0] * log_step
+                    tput = total_bs / avg_dur
                     losses = [l.item() for l in losses]
-                    message1 = "Step {}/{}, ".format(step, total_step)
+                    message1 = "Step {}/{}, LR: {:.3e} ".format(step, total_step, optimizer.lr)
                     message2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Pitch Loss: {:.4f}, Energy Loss: {:.4f}, Duration Loss: {:.4f}".format(
                         *losses
                     )
+                    message3 = f"[{total_bs}, {batch[3].dtype}]Throughput: {tput} samples/s, Duration: {avg_dur:.2f}s"
 
                     with open(os.path.join(train_log_path, "log.txt"), "a") as f:
-                        f.write(message1 + message2 + "\n")
+                        f.write(message1 + message2 + message3 + "\n")
 
-                    outer_bar.write(message1 + message2)
+                    outer_bar.write(message1 + message2 + message3)
 
                     log(train_logger, step, losses=losses)
+                    avg_dur = 0.0
 
                 if step % synth_step == 0:
                     fig, wav_reconstruction, wav_prediction, tag = synth_one_sample(
